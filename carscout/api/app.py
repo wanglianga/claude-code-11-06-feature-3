@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-from carscout import matching
+from carscout import matching, rules
 from carscout.api import export
 from carscout.config import settings
 from carscout.db import pool
@@ -120,7 +120,7 @@ def vehicles(
                (SELECT count(*) FROM listing_price_events e JOIN listings l ON l.id = e.listing_id
                 WHERE l.vehicle_id = v.id AND e.previous_price > e.price_yuan) AS price_cuts,
                EXISTS (SELECT 1 FROM listings l WHERE l.vehicle_id = v.id
-                       AND l.match_status IN ('manual_pending', 'rejected')) AS provisional
+                       AND l.match_status IN ('manual_pending', 'rejected', 'pending_rereview')) AS provisional
         FROM vehicles v
         WHERE (%s::text IS NULL OR v.series = %s::text)
           AND (%s::text IS NULL OR v.brand = %s::text)
@@ -234,7 +234,7 @@ def review_confirm(candidate_id: int, body: ConfirmBody) -> dict[str, Any]:
 
 
 @app.get("/api/rules", tags=["review"], summary="已沉淀的归并规则")
-def rules() -> list[dict[str, Any]]:
+def list_match_rules() -> list[dict[str, Any]]:
     rows = pool.query("SELECT * FROM match_rules ORDER BY applied_count DESC, id")
     for r in rows:
         r["confidence"] = float(r["confidence"]) if r.get("confidence") is not None else None
@@ -253,6 +253,148 @@ def candidate(candidate_id: int) -> dict[str, Any]:
     a = pool.query_one("SELECT * FROM listings WHERE id = %s", (row["listing_a"],))
     b = pool.query_one("SELECT * FROM listings WHERE id = %s", (row["listing_b"],))
     return {"candidate": row, "listing_a": a, "listing_b": b}
+
+
+# ---------------------------------------------------------------------------
+# versioned merge rules: 配置化 / 灰度 / 回放审批 / 回滚 / 证据解释
+# ---------------------------------------------------------------------------
+class RuleVersionBody(BaseModel):
+    name: str = Field(..., description="规则版本名称")
+    spec: dict[str, Any] = Field(..., description="完整规则参数（可先 GET default-spec 取模板）")
+    changelog: str | None = None
+    created_by: str = "operator"
+
+
+class ActivateBody(BaseModel):
+    actor: str = "operator"
+    initial_rollout: dict[str, int] | None = Field(
+        None, description="激活时的初始放量，如 {\"A\": 10}；缺省为 0%（不放量）")
+
+
+class RolloutBody(BaseModel):
+    rollouts: dict[str, int] = Field(..., description="平台 -> 放量百分比 0~100，键为 A/B/C/D 或 *")
+    actor: str = "operator"
+
+
+class RollbackBody(BaseModel):
+    reason: str = ""
+    actor: str = "operator"
+
+
+class ReplayDecisionBody(BaseModel):
+    approve: bool
+    reviewer: str = "operator"
+    note: str | None = None
+
+
+@app.get("/api/rule-versions/default-spec", tags=["rules"],
+         summary="规则 spec 模板（v1 基线参数，可在此基础上修改后提交新版本）")
+def default_rule_spec() -> dict[str, Any]:
+    return rules.default_spec()
+
+
+@app.get("/api/rule-versions", tags=["rules"], summary="全部规则版本（含放量比例）")
+def rule_versions() -> list[dict[str, Any]]:
+    return rules.list_versions()
+
+
+@app.post("/api/rule-versions", tags=["rules"], status_code=201,
+          summary="创建规则版本草稿（阈值/权重/必要证据全部版本化管理）")
+def create_rule_version(body: RuleVersionBody) -> dict[str, Any]:
+    try:
+        return rules.create_version(body.spec, name=body.name, changelog=body.changelog,
+                                    created_by=body.created_by)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/rule-versions/{version_id}", tags=["rules"], summary="单个规则版本详情")
+def rule_version(version_id: int) -> dict[str, Any]:
+    row = rules.get_version(version_id)
+    if not row:
+        raise HTTPException(404, "rule version not found")
+    row["rollouts"] = rules.get_rollout(version_id)
+    return row
+
+
+@app.post("/api/rule-versions/{version_id}/replay", tags=["rules"],
+          summary="在历史存量上离线回放，预估新增合并/拆散人工确认数（只读，不改存量）")
+def replay_rule_version(version_id: int, requester: str = "operator") -> dict[str, Any]:
+    try:
+        return rules.replay_version(version_id, actor=requester)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/replays", tags=["rules"], summary="离线回放记录与影响预估")
+def replays(version_id: int | None = None) -> list[dict[str, Any]]:
+    return rules.list_replays(version_id)
+
+
+@app.get("/api/replays/{replay_id}", tags=["rules"])
+def replay_detail(replay_id: int) -> dict[str, Any]:
+    row = pool.query_one("SELECT * FROM merge_rule_replays WHERE id = %s", (replay_id,))
+    if not row:
+        raise HTTPException(404, "replay not found")
+    return row
+
+
+@app.post("/api/replays/{replay_id}/decision", tags=["rules"],
+          summary="人工审批回放（超过影响门槛时激活前必须审批通过）")
+def decide_replay(replay_id: int, body: ReplayDecisionBody) -> dict[str, Any]:
+    try:
+        return rules.decide_replay(replay_id, body.approve, reviewer=body.reviewer, note=body.note)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.post("/api/rule-versions/{version_id}/activate", tags=["rules"],
+          summary="激活规则版本；未回放或超门槛未审批将被拒绝")
+def activate_rule_version(version_id: int, body: ActivateBody) -> dict[str, Any]:
+    try:
+        return rules.activate_version(version_id, actor=body.actor,
+                                      initial_rollout=body.initial_rollout)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/rule-versions/{version_id}/rollout", tags=["rules"],
+          summary="按平台灰度放量（哈希分桶，可随时调大/调小/归零）")
+def set_rule_rollout(version_id: int, body: RolloutBody) -> dict[str, Any]:
+    try:
+        return rules.set_rollout(version_id, body.rollouts, actor=body.actor)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/rule-versions/{version_id}/rollback", tags=["rules"],
+          summary="回滚：切回上一版本；新版本合并过的记录转待复核，绝不自动拆回")
+def rollback_rule_version(version_id: int, body: RollbackBody) -> dict[str, Any]:
+    active = rules.active_version_row()
+    if not active or int(active["id"]) != version_id:
+        raise HTTPException(400, "只能回滚当前 active 版本")
+    try:
+        return rules.rollback_active(actor=body.actor, reason=body.reason)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/pending-rereview", tags=["rules"],
+         summary="回滚后被标记为待复核的挂牌（保留原归并关系，等待人工处理）")
+def pending_rereview(limit: int = Query(500, ge=1, le=2000)) -> dict[str, Any]:
+    rows = rules.pending_rereview_listings(limit=limit)
+    return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/explain", tags=["rules"],
+         summary="证据级解释：两条车源为何被判为同一台车、命中哪些证据、各自权重")
+def explain(listing_a: int = Query(..., description="挂牌 id A"),
+            listing_b: int = Query(..., description="挂牌 id B"),
+            rule_version_id: int | None = Query(None, description="缺省用当前 active 版本")) -> dict[str, Any]:
+    try:
+        return matching.explain_pair(listing_a, listing_b, rule_version_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
 
 
 # ---------------------------------------------------------------------------

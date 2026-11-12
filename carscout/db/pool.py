@@ -54,6 +54,10 @@ def init_schema() -> None:
         conn.execute(sql)
         conn.commit()
     seed_platforms()
+    # versioned merge rules: seed the v1 baseline (idempotent)
+    from carscout.rules import ensure_baseline_version
+
+    ensure_baseline_version()
 
 
 def seed_platforms() -> None:

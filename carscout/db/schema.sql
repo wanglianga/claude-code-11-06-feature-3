@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS listings (
     removed_at          TIMESTAMPTZ,
     price_observed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     vehicle_id          BIGINT REFERENCES vehicles(id),
-    match_status        TEXT NOT NULL DEFAULT 'unmatched', -- unmatched | auto | manual_pending | manual_confirmed | ruled | rejected
+    match_status        TEXT NOT NULL DEFAULT 'unmatched', -- unmatched | auto | manual_pending | manual_confirmed | ruled | rejected | pending_rereview
     match_score         NUMERIC(5,4),
     raw_list            JSONB NOT NULL DEFAULT '{}'::jsonb,
     raw_detail          JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -233,10 +233,71 @@ CREATE TABLE IF NOT EXISTS app_settings (
 );
 
 -- ---------------------------------------------------------------------------
+-- 归并规则版本化：阈值 / 字段权重 / 必要证据 / 灰度放量 / 离线回放
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS merge_rule_versions (
+    id                  BIGSERIAL PRIMARY KEY,
+    version             INTEGER NOT NULL UNIQUE,
+    name                TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'draft',      -- draft | active | inactive | rollback（回放审批在 merge_rule_replays.status）
+    spec                JSONB NOT NULL,                     -- 完整规则参数（阈值/权重/必要证据/闸门/召回）
+    changelog           TEXT,
+    created_by          TEXT NOT NULL DEFAULT 'operator',
+    approved_by         TEXT,
+    approved_at         TIMESTAMPTZ,
+    activated_at        TIMESTAMPTZ,
+    rolled_back_at      TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS merge_rule_versions_status_idx ON merge_rule_versions (status, version);
+
+CREATE TABLE IF NOT EXISTS merge_rule_rollouts (
+    id                  BIGSERIAL PRIMARY KEY,
+    rule_version_id     BIGINT NOT NULL REFERENCES merge_rule_versions(id) ON DELETE CASCADE,
+    platform            TEXT NOT NULL,                      -- A/B/C/D；'*' 表示全平台兜底
+    rollout_pct         INTEGER NOT NULL CHECK (rollout_pct BETWEEN 0 AND 100),
+    updated_by          TEXT NOT NULL DEFAULT 'operator',
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (rule_version_id, platform)
+);
+CREATE INDEX IF NOT EXISTS merge_rule_rollouts_version_idx ON merge_rule_rollouts (rule_version_id);
+
+CREATE TABLE IF NOT EXISTS merge_rule_replays (
+    id                  BIGSERIAL PRIMARY KEY,
+    rule_version_id     BIGINT NOT NULL REFERENCES merge_rule_versions(id) ON DELETE CASCADE,
+    baseline_version_id BIGINT REFERENCES merge_rule_versions(id),
+    status              TEXT NOT NULL DEFAULT 'pending',    -- pending | approved | rejected
+    pairs_evaluated     INTEGER NOT NULL DEFAULT 0,
+    extra_merges        INTEGER NOT NULL DEFAULT 0,         -- 新增自动合并的配对数
+    split_confirmed     INTEGER NOT NULL DEFAULT 0,         -- 会拆散的已人工确认组合数
+    extra_gray          INTEGER NOT NULL DEFAULT 0,         -- 原自动合并 -> 灰区
+    extra_rejects       INTEGER NOT NULL DEFAULT 0,         -- 原灰区/合并 -> 直接拒绝
+    unchanged           INTEGER NOT NULL DEFAULT 0,
+    approval_threshold  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    exceeds_threshold   BOOLEAN NOT NULL DEFAULT FALSE,
+    report              JSONB NOT NULL DEFAULT '{}'::jsonb,-- 明细样本（证据级差异）
+    requested_by        TEXT NOT NULL DEFAULT 'operator',
+    reviewed_by         TEXT,
+    reviewed_at         TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS merge_rule_replays_version_idx ON merge_rule_replays (rule_version_id, id DESC);
+
+-- ---------------------------------------------------------------------------
 -- Idempotent migrations (CREATE TABLE IF NOT EXISTS does not add columns)
 -- ---------------------------------------------------------------------------
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS removed_at TIMESTAMPTZ;
 ALTER TABLE crawl_cursors ADD COLUMN IF NOT EXISTS last_error JSONB;
 ALTER TABLE crawl_cursors ADD COLUMN IF NOT EXISTS stopped_reason TEXT;
+-- 规则版本戳：每条挂牌/候选按哪个规则版本判定；回滚后新规则合并的记录转 pending_rereview
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS rule_version_id BIGINT REFERENCES merge_rule_versions(id);
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS pending_rereview_reason TEXT;
+ALTER TABLE match_candidates ADD COLUMN IF NOT EXISTS rule_version_id BIGINT REFERENCES merge_rule_versions(id);
+ALTER TABLE match_candidates ADD COLUMN IF NOT EXISTS evidence JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS rule_version_id BIGINT REFERENCES merge_rule_versions(id);
 CREATE INDEX IF NOT EXISTS listings_active_idx ON listings (platform, is_active, last_seen_at);
+CREATE INDEX IF NOT EXISTS listings_rule_version_idx ON listings (rule_version_id);
+CREATE INDEX IF NOT EXISTS listings_pending_rereview_idx ON listings (match_status)
+    WHERE match_status = 'pending_rereview';

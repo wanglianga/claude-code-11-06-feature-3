@@ -19,7 +19,8 @@ carscout/
   config.py           全部配置项（环境变量驱动，见 .env.example）
   parsers.py          四个平台的字段解析与异常分类
   store.py            挂牌落库：增量、价格变动、图片哈希
-  matching.py         跨平台归并：VIN 直判 → 特征召回 → 打分 → 灰区 → 规则复用
+  matching.py         跨平台归并：VIN 直判 → 特征召回 → 打分 → 灰区 → 规则复用（参数全部来自规则版本，输出证据级解释）
+  rules.py            归并规则版本生命周期：版本 CRUD、离线回放审批、按平台灰度放量、回滚（不自动拆回）
   ingest.py           原始响应留档、失败分类、平台健康与熔断
   images.py           远端图片抓取 + pHash
   crawl/
@@ -107,6 +108,9 @@ carscout export --series 凯美瑞 --format csv  # 报价分布（csv）
 carscout review --export --out review.csv     # 导出灰区候选
 carscout review --import-file review.csv      # 回传确认结果并沉淀规则
 carscout archive-grep "行驶里程" -p A --date 2026-11-12   # 离线复盘归档原文
+carscout rules list                           # 规则版本与放量比例（完整子命令见 §13.4）
+carscout rules replay --version-id 2          # 新规则历史存量离线回放
+carscout rules explain --a 12 --b 18          # 两条车源的证据级判定解释
 ```
 
 ---
@@ -207,6 +211,10 @@ carscout archive-grep "行驶里程" -p A --date 2026-11-12   # 离线复盘归�
 首次挂牌时间。单车档案 `GET /api/vehicles/{id}` 直接回答：
 「在几个平台挂过、各挂多少钱、降过几次价、首次挂牌距今多久」。
 
+> 上面打分用到的**全部阈值、字段权重、证据闸门、必要条件都不再写死在代码里**，
+> 而是作为带版本号的规则（`merge_rule_versions`）管理，支持离线回放审批、
+> 按平台灰度放量、随时回滚与证据级解释，完整机制见 **§13**。
+
 ---
 
 ## 8. 对外接口（Swagger UI: `http://localhost:8000/docs`）
@@ -226,6 +234,17 @@ carscout archive-grep "行驶里程" -p A --date 2026-11-12   # 离线复盘归�
 | POST | `/api/review/import-file` | 回传 CSV（multipart 文件） |
 | POST | `/api/review/{candidate_id}/confirm` | 单条确认 |
 | GET | `/api/rules` | 已沉淀规则 |
+| GET | `/api/rule-versions/default-spec` | 规则 spec 模板（v1 基线参数） |
+| GET/POST | `/api/rule-versions` | 规则版本列表 / 创建版本草稿 |
+| GET | `/api/rule-versions/{id}` | 单版本详情（spec + 放量比例） |
+| POST | `/api/rule-versions/{id}/replay` | 历史存量离线回放与影响预估（只读） |
+| GET | `/api/replays` `/api/replays/{id}` | 回放记录与明细样本 |
+| POST | `/api/replays/{id}/decision` | 超门槛回放的人工审批（approve/reject） |
+| POST | `/api/rule-versions/{id}/activate` | 激活版本（未回放/未审批会被拒绝） |
+| POST | `/api/rule-versions/{id}/rollout` | 按平台灰度放量（`{"A":10,"B":0}`） |
+| POST | `/api/rule-versions/{id}/rollback` | 回滚：记录转待复核，不自动拆回 |
+| GET | `/api/pending-rereview` | 回滚后待复核挂牌（保留原归并关系） |
+| GET | `/api/explain?listing_a=&listing_b=` | **证据级解释**：命中证据、权重、判定依据 |
 | POST | `/api/runs` | **按平台 / 指定日期重跑**（`{"platforms":["A"],"day":"2026-11-12","mode":"rerun"}`，`wait=true` 同步返回汇总） |
 | GET | `/api/runs` `/api/anomalies` `/api/archive` | 运行轨迹、失败分类、留档索引 |
 
@@ -242,9 +261,11 @@ candidate_id,listing_a,listing_b,score,city_a,city_b,mileage_a,mileage_b,reg_a,r
 
 `platforms` / `crawl_runs` / `crawl_cursors` / `platform_health` /
 `vehicles` / `listings` / `listing_price_events` / `image_hashes`（独立表，按
-`(listing_id, image_url)` 唯一，支持相似度检索）/ `match_candidates` /
-`manual_review_queue` / `match_rules` / `ingest_archive` / `ingest_anomalies`。
-`db/schema.sql` 幂等，服务启动时自动执行并补齐列。
+`(listing_id, image_url)` 唯一，支持相似度检索）/ `match_candidates`（含
+`rule_version_id` 与证据级 `evidence`）/ `manual_review_queue` / `match_rules` /
+`merge_rule_versions` / `merge_rule_rollouts` / `merge_rule_replays`（规则版本化
+三件套，见 §13.5）/ `ingest_archive` / `ingest_anomalies`。
+`db/schema.sql` 幂等，服务启动时自动执行并补齐列与基线规则版本。
 
 ---
 
@@ -293,12 +314,38 @@ pytest tests -q --ignore=tests/test_e2e_crawl.py \
                   --ignore=tests/test_e2e_review.py --ignore=tests/test_e2e_crash.py   # 仅单元/接口（约 20 秒）
 ```
 
-已执行结果：**`pytest tests -q` 63 项全部通过（806.54s）**。
-其中单元/接口/存储/解析/归并/调度/看门狗 46 项（约 21 秒）；
-端到端 `test_e2e_crawl.py` 13 项（约 10 分钟）、`test_e2e_review.py` 3 项、
-`test_e2e_crash.py` 1 项（SIGKILL 后续采）。
+已执行结果（本批次在隔离工作区实测）：**全量 76 项全部通过**。
 
-覆盖的关键断言：
+- 快速套件 59 项（约 20 秒；含本特性新增 `test_rule_versions.py` 13 项：
+  规则校验、必要证据降级、回放预估与审批拦截、灰度分桶、回滚不拆回、
+  rebuild 版本戳、证据解释、HTTP 全生命周期）；
+- 端到端 `test_e2e_review.py` 3 项（130.57s）、
+  `test_e2e_crawl.py` + `test_e2e_crash.py` 14 项（510.91s，真实
+  Scrapy + Playwright + PG + Redis 四平台链路）。
+
+> 本机环境适配（如实说明）：开发机系统库自带的 PostgreSQL 无 `carscout`
+> 角色且不可登录，本次在用户目录用 `initdb` 起了一个等价的 PostgreSQL 15
+> 集群（端口 5433、trust 认证），通过 `CARSCOUT_DATABASE_URL` 指向它执行，
+> 应用代码与 SQL 完全一致；Python 依赖装在项目内 `.venv`；Playwright
+> Chromium 缺失的 12 个系统库以用户态 deb 解包 + `LD_LIBRARY_PATH` 补齐
+> （Docker 镜像内由 Dockerfile 的 apt 清单直接提供，无需此处理）。
+
+规则版本化相关新增断言：
+
+| 用例 | 断言 |
+|---|---|
+| `test_baseline_version_seeded_with_legacy_parameters` | v1 自动种子；同一对挂牌走旧兜底与走 v1 RuleSpec 的总分/分项完全一致 |
+| `test_create_version_validates_thresholds_and_required_evidence` | 阈值倒挂、非法必要证据、缺权重的 spec 被拒绝 |
+| `test_required_vin_evidence_downgrades_auto_merge_to_grey_zone` | 配 `vin_match` 必要条件后，无 VIN 的高分配对从自动合并降为灰区；双方 VIN 一致时照常合并 |
+| `test_required_image_evidence_blocks_when_photo_disagrees` | 图片不一致且被列为必要证据时 `required_block=image_agreement`，进人工队列 |
+| `test_replay_estimates_impact_and_blocks_activation_until_approved` | 回放给出新增合并/拆散人工确认数；超门槛未审批（含审批被拒）禁止激活，审批通过后放行 |
+| `test_replay_within_threshold_activates_without_approval` | 影响在门槛内可直接激活 |
+| `test_simulate_clustering_matches_live_partition` | 离线模拟聚类与线上真实分区一致 |
+| `test_rollout_percentage_uses_stable_hash_buckets` | 分桶稳定可复现、比例生效、平台精确配置优先于 `*` 通配 |
+| `test_rollback_flags_listings_pending_rereview_without_splitting` | 回滚后记录转 `pending_rereview`、保留 `vehicle_id`、车源数不变、自动归并不再触碰、进入复核队列且可人工 split |
+| `test_rebuild_restamps_listings_using_active_version_rollout` | `merge --rebuild` 按 active 版本重新打版本戳并保留证据 |
+| `test_explain_pair_reports_every_evidence_with_weight` | explain 输出每条证据的命中/权重/贡献/细节，并能反映必要证据缺失 |
+| `test_full_rule_lifecycle_via_http` | API 走完建版本→回放→审批→激活→放量→解释→回滚全链路 |
 
 | 用例 | 断言 |
 |---|---|
@@ -348,10 +395,11 @@ C 13.5 万（灰区未并入）、D 13.9 万。
 > - 开发环境中**没有安装 Docker**，因此 `docker compose up` 未实际执行；
 >   `Dockerfile` / `docker-compose.yml` 经过 YAML 解析与服务依赖/健康检查复核，
 >   Chromium 系统库清单来自本机实测缺失库（同一 Debian 12 基础镜像）。
-> - 其余验证（63 项自动化测试、CLI 全流程、API、价格变动、人工确认回传、
+> - 其余验证（自动化测试共 76 项，见 §11.1；CLI 全流程、API、价格变动、人工确认回传、
 >   SIGKILL 续采、看门狗）均在本机以**与容器内相同的代码路径**
 >   （`carscout run` → `crawl.worker` 子进程 → Scrapy/Playwright → PG/Redis）
->   实际执行并记录结果。
+>   实际执行并记录结果。本批次新增的规则版本化 CLI/API 全链路冒烟同样在本机实测，
+>   环境适配方式见 §11.1 说明。
 
 ---
 
@@ -362,3 +410,121 @@ C 13.5 万（灰区未并入）、D 13.9 万。
   的签名逻辑，不伪造或破解签名算法，过期自动重签（真实接入时按平台授权方式配置）。
 - `ROBOTSTXT_OBEY=False` 仅针对本仓库自带的伪造联调服务；接入真实平台前需按
   合作/授权约定调整频次与范围（配置项已集中在 `config.py`）。
+
+---
+
+## 13. 归并规则配置化、灰度上线与证据级解释
+
+### 13.1 一切判定参数都是带版本的规则
+
+`merge_rule_versions` 每一行是一份**不可变的完整规则快照**（`spec` JSONB），
+首版 `v1` 在 `init-db` 时自动写入，参数与历史硬编码完全等价（因此老行为零变化）。
+`spec` 覆盖打分链路上的每一个旋钮：
+
+```json
+{
+  "thresholds": {"auto_merge": 0.82, "gray_zone": 0.60},
+  "weights": {"series": 0.34, "reg_month": 0.16, "mileage": 0.14, "city": 0.08,
+              "transmission": 0.04, "displacement": 0.03, "transfer": 0.03,
+              "image": 0.30, "text": 0.26},
+  "recall": {"reg_months": 9, "mileage_km": 9000, "candidate_limit": 40},
+  "gates": {"image_hamming": 12, "text_similarity": 0.25, "cap_offset": 0.17},
+  "required_evidence": ["vin_match"],
+  "scoring": {"series_min": 0.70, "vin_conflict_penalty": -0.10, "...": "其余数值参数"}
+}
+```
+
+- **相似度阈值**：`thresholds.auto_merge / gray_zone`。
+- **字段权重**：`weights` 九项（车系/上牌年月/里程/城市/变速箱/排量/过户/图片/描述）。
+- **必要证据**：`required_evidence` 可选 `vin_match`（必须 VIN 一致才允许自动合并）、
+  `image_agreement`（图片必须一致）、`text_agreement`（描述必须一致）。
+  必要条件不满足时**不会直接拆散**，而是把分数压到灰区、强制人工确认；
+  创建版本时对取值范围与字段完整性做校验（`rules.validate_spec`）。
+- 每次判定把使用的版本 id 写到 `listings.rule_version_id`、
+  `match_candidates.rule_version_id` 与 `vehicles.rule_version_id`，可逐条审计。
+
+### 13.2 上线流程：离线回放 → 超门槛人工审批 → 灰度放量 → 可回滚
+
+```
+draft ──replay──▶ 影响预估 ──未超门槛或已审批──▶ active（按平台放量）
+                    │ 超过审批门槛且未审批 => 禁止激活
+active ──rollback──▶ rollback（记录转 pending_rereview，保留 vehicle_id，不自动拆回）
+```
+
+1. **创建草稿**：`carscout rules default-spec` 取模板，改完用
+   `rules create --spec-file v2.json`（或 `POST /api/rule-versions`）提交为 `draft`。
+2. **离线回放**：`rules replay --version-id N`（或 `POST .../replay`）。
+   服务在内存里分别用「新规则」和「当前基线」对**全量存量挂牌**重新聚类
+   （`matching.simulate_clustering`，只读、不改任何存量），输出：
+   - `extra_merges`：新规则会**新增多少组合并**（基线判不同车、新规则判同车）；
+   - `split_confirmed`：会**拆散多少组已人工确认的组合**（`manual_confirmed`）；
+   - `extra_gray / extra_rejects / unchanged`：判定漂移统计；
+   - `report.samples`：最多 50 条带证据明细的差异样本。
+3. **审批门槛**：`REPLAY_MAX_EXTRA_MERGES`（默认 10）与
+   `REPLAY_MAX_SPLIT_CONFIRMED`（默认 0）任一被突破，`exceeds_threshold=true`，
+   此时激活被拒绝，必须 `rules approve --replay-id M`（或
+   `POST /api/replays/{id}/decision`）人工审批后才能继续；审批拒绝同样阻断激活。
+4. **灰度放量**：激活后用 `rules rollout --set A=10 --set B=0`
+   （或 `POST .../rollout`）按平台调百分比。分桶键是
+   `md5(platform:listing_id) % 100`，**同一条挂牌永远落在同一桶**，
+   调大/调小比例不会让单条记录在新旧规则间反复横跳；未命中放量的流量继续走
+   v1 基线。支持 `*` 通配平台，平台精确配置优先于通配。
+5. **回滚**：`rules rollback --reason "..."`（或 `POST .../rollback`）立即切回
+   上一版本。所有「按被回滚版本合并」且状态为 `auto/ruled` 的挂牌被置为
+   `pending_rereview` 并写入原因，但**保留 `vehicle_id`、绝不自动拆回**——
+   车源数、报价分布等历史统计不会跳变。受影响配对以 `rollback-vN` 批次进入
+   既有人工确认队列（`GET /api/pending-rereview`、`carscout rules rereview`），
+   人工通过原 CSV/confirm 回路复核；自动归并批次会跳过这些挂牌。
+
+### 13.3 证据级解释：为什么判同一台车、命中哪几条证据、各自权重多少
+
+每条候选在 `match_candidates.evidence` 留存证据数组；也可随时对任意两条挂牌
+即时解释：`GET /api/explain?listing_a=1&listing_b=2`（CLI：`carscout rules explain --a 1 --b 2`）：
+
+```json
+{
+  "score": 0.8721, "decision": "auto_merge",
+  "rule_version": {"id": 1, "version": 1, "required_evidence": ["vin_match"]},
+  "required_block": null,
+  "gates": {"capped": false, "image_conflict": false, "text_disagreement": false},
+  "evidence": [
+    {"code": "series", "label": "品牌车系相似度", "matched": true,
+     "weight": 0.34, "contribution": 0.34, "detail": {"raw_similarity": 1.0}},
+    {"code": "vin_match", "label": "VIN 后六位一致（必要证据候选）", "matched": true,
+     "weight": null, "contribution": 1.0, "detail": {"vin_tail6": "AB12CD"}},
+    {"code": "image_agreement", "label": "图片感知哈希(pHash)一致性", "matched": true,
+     "weight": 0.30, "contribution": 0.291,
+     "detail": {"hamming_distance": 1, "gate_distance": 12, "raw_similarity": 0.97}}
+  ]
+}
+```
+
+每条证据给出：证据代码与中文名、是否命中、该字段权重、实际加权贡献、
+判定细节（原始相似度/距离/差值/闸门阈值）。`decision` 取值
+`auto_merge / manual_review / gray / separate / reject`；
+`required_block` 标明是哪条必要证据未满足，`gates` 标明是否被图片/描述闸门压分。
+
+### 13.4 完整操作示例（CLI）
+
+```bash
+carscout rules default-spec > v2.json          # 取 v1 模板
+# 编辑 v2.json：例如 thresholds 改 0.80、required_evidence 加 "vin_match"
+carscout rules create --name "VIN必要条件版" --spec-file v2.json --changelog "收紧自动合并"
+carscout rules replay --version-id 2           # 只读回放，看新增合并/拆散预估
+carscout rules approve --replay-id 1           # 仅超门槛时需要
+carscout rules activate --version-id 2 --rollout A=10   # 先在 A 平台放 10%
+carscout rules rollout --version-id 2 --set A=50 --set B=20   # 观察后逐步放量
+carscout rules explain --a 12 --b 18           # 证据级解释某一对
+carscout rules rollback --reason "A 平台误合并增多"        # 一键回滚
+carscout rules rereview                        # 看待复核清单（不自动拆回）
+```
+
+### 13.5 对应的数据模型
+
+新增 `merge_rule_versions`（版本与 spec、状态机 draft/active/inactive/rollback、
+审批与激活时间戳；回放审批结论挂在 `merge_rule_replays.status`）、
+`merge_rule_rollouts`（版本 × 平台放量比例）、
+`merge_rule_replays`（回放预估、门槛、审批结论、差异样本）；`listings` /
+`match_candidates` / `vehicles` 增加 `rule_version_id`，`match_candidates` 增加
+`evidence`，`listings` 增加 `pending_rereview_reason`，`match_status` 增加
+`pending_rereview` 状态。所有 DDL 幂等，服务启动 `init-db` 自动迁移并补种子。

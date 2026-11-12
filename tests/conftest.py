@@ -57,7 +57,11 @@ def clean_db():
     init_schema()
     execute("""TRUNCATE listings, vehicles, crawl_runs, crawl_cursors, platform_health,
                       match_candidates, manual_review_queue, listing_price_events,
-                      image_hashes, ingest_archive, ingest_anomalies, match_rules
+                      image_hashes, ingest_archive, ingest_anomalies, match_rules,
+                      merge_rule_versions, merge_rule_rollouts, merge_rule_replays
                RESTART IDENTITY CASCADE""")
     get_redis().flushdb()
+    from carscout.rules import ensure_baseline_version
+
+    ensure_baseline_version()
     yield

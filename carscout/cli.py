@@ -209,6 +209,185 @@ def export_cmd(series, brand, days, fmt, out) -> None:
 
 
 # ---------------------------------------------------------------------------
+@cli.group(name="rules")
+def rules_group() -> None:
+    """归并规则版本：配置化、离线回放审批、灰度放量、回滚、证据解释。"""
+
+
+@rules_group.command(name="default-spec")
+def rules_default_spec() -> None:
+    """打印 v1 基线 spec 模板（修改后用 create 提交新版本）。"""
+    from carscout.rules import default_spec
+
+    emit(default_spec())
+
+
+@rules_group.command(name="list")
+def rules_list() -> None:
+    """全部规则版本与放量比例。"""
+    from carscout.db.pool import init_schema
+    from carscout import rules
+
+    init_schema()
+    emit(rules.list_versions())
+
+
+@rules_group.command(name="show")
+@click.option("--version-id", type=int, required=True)
+def rules_show(version_id: int) -> None:
+    """单个规则版本详情（含 spec 与 rollouts）。"""
+    from carscout.db.pool import init_schema
+    from carscout import rules
+
+    init_schema()
+    row = rules.get_version(version_id)
+    if not row:
+        raise click.ClickException(f"rule version {version_id} not found")
+    row = dict(row)
+    row["rollouts"] = rules.get_rollout(version_id)
+    emit(row)
+
+
+@rules_group.command(name="create")
+@click.option("--name", required=True)
+@click.option("--spec-file", type=click.Path(exists=True, dir_okay=False), required=True,
+              help="JSON 文件：完整规则 spec（可从 default-spec 模板修改）")
+@click.option("--changelog", default=None)
+@click.option("--created-by", default="operator")
+def rules_create(name: str, spec_file: str, changelog: str | None, created_by: str) -> None:
+    """创建规则版本草稿（阈值/权重/必要证据全部版本化）。"""
+    from carscout.db.pool import init_schema
+    from carscout import rules
+
+    init_schema()
+    spec = json.loads(open(spec_file, encoding="utf-8").read())
+    try:
+        emit(rules.create_version(spec, name=name, changelog=changelog, created_by=created_by))
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+
+@rules_group.command(name="replay")
+@click.option("--version-id", type=int, required=True)
+@click.option("--requester", default="operator")
+def rules_replay(version_id: int, requester: str) -> None:
+    """在历史存量上离线回放，输出新增合并/拆散人工确认预估（只读）。"""
+    from carscout.db.pool import init_schema
+    from carscout import rules
+
+    init_schema()
+    try:
+        emit(rules.replay_version(version_id, actor=requester))
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+
+@rules_group.command(name="approve")
+@click.option("--replay-id", type=int, required=True)
+@click.option("--reject", "do_reject", is_flag=True, help="拒绝（默认审批通过）")
+@click.option("--reviewer", default="operator")
+@click.option("--note", default=None)
+def rules_approve(replay_id: int, do_reject: bool, reviewer: str, note: str | None) -> None:
+    """对超过门槛的回放做人工审批。"""
+    from carscout.db.pool import init_schema
+    from carscout import rules
+
+    init_schema()
+    try:
+        emit(rules.decide_replay(replay_id, not do_reject, reviewer=reviewer, note=note))
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+
+@rules_group.command(name="activate")
+@click.option("--version-id", type=int, required=True)
+@click.option("--actor", default="operator")
+@click.option("--rollout", "rollouts", multiple=True, metavar="PLATFORM=PCT",
+              help="初始放量，可重复：--rollout A=10 --rollout B=0")
+def rules_activate(version_id: int, actor: str, rollouts: tuple[str, ...]) -> None:
+    """激活版本：未回放或超门槛未审批会被拒绝。"""
+    from carscout.db.pool import init_schema
+    from carscout import rules
+
+    init_schema()
+    initial = _parse_rollout_kv(rollouts)
+    try:
+        emit(rules.activate_version(version_id, actor=actor, initial_rollout=initial))
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+
+@rules_group.command(name="rollout")
+@click.option("--version-id", type=int, required=True)
+@click.option("--set", "rollouts", multiple=True, metavar="PLATFORM=PCT",
+              help="按平台放量比例，可重复：--set A=10 --set *=50")
+@click.option("--actor", default="operator")
+def rules_rollout(version_id: int, rollouts: tuple[str, ...], actor: str) -> None:
+    """调整灰度放量（哈希分桶，可随时调大/调小/归零）。"""
+    from carscout.db.pool import init_schema
+    from carscout import rules
+
+    init_schema()
+    try:
+        emit(rules.set_rollout(version_id, _parse_rollout_kv(rollouts), actor=actor))
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+
+@rules_group.command(name="rollback")
+@click.option("--reason", default="")
+@click.option("--actor", default="operator")
+def rules_rollback(reason: str, actor: str) -> None:
+    """回滚当前 active 版本；已合并记录转待复核，不自动拆回。"""
+    from carscout.db.pool import init_schema
+    from carscout import rules
+
+    init_schema()
+    try:
+        emit(rules.rollback_active(actor=actor, reason=reason))
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+
+@rules_group.command(name="rereview")
+@click.option("--limit", type=int, default=100)
+def rules_rereview(limit: int) -> None:
+    """列出回滚后待复核的挂牌（保留原归并关系）。"""
+    from carscout.db.pool import init_schema
+    from carscout import rules
+
+    init_schema()
+    rows = rules.pending_rereview_listings(limit=limit)
+    emit({"count": len(rows), "items": rows})
+
+
+@rules_group.command(name="explain")
+@click.option("--a", "listing_a", type=int, required=True, help="挂牌 id A")
+@click.option("--b", "listing_b", type=int, required=True, help="挂牌 id B")
+@click.option("--version-id", type=int, default=None, help="规则版本 id，缺省用 active")
+def rules_explain(listing_a: int, listing_b: int, version_id: int | None) -> None:
+    """证据级解释：为何判为同一台车、命中哪些证据、各自权重多少。"""
+    from carscout.db.pool import init_schema
+    from carscout import matching
+
+    init_schema()
+    try:
+        emit(matching.explain_pair(listing_a, listing_b, version_id))
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+
+def _parse_rollout_kv(pairs: tuple[str, ...]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for kv in pairs:
+        if "=" not in kv:
+            raise click.BadParameter(f"放量参数应为 PLATFORM=PCT，收到 {kv!r}")
+        plat, pct = kv.split("=", 1)
+        out[plat.strip().upper()] = int(pct.strip())
+    return out
+
+
+# ---------------------------------------------------------------------------
 @cli.command()
 def status() -> None:
     """Platform health, cursor progress and inventory counts."""

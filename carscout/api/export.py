@@ -177,7 +177,8 @@ def export_review_csv(*, batch_id: str | None = None, status: str = "pending",
             SELECT batch_id, status FROM manual_review_queue mq
             WHERE mq.candidate_id = c.id ORDER BY mq.id DESC LIMIT 1
         ) q ON TRUE
-        WHERE c.state = 'manual_pending'
+        WHERE c.state IN ('manual_pending', 'auto_merged', 'rule_applied')
+          AND q.batch_id IS NOT NULL
           AND (%s::text IS NULL OR q.batch_id = %s::text)
           AND (%s::text IS NULL OR q.status = %s::text)
           AND (%s::float IS NULL OR c.score >= %s::float)
@@ -257,13 +258,18 @@ def overview() -> dict[str, Any]:
         """SELECT count(*) AS n,
                   count(*) FILTER (WHERE EXISTS (
                       SELECT 1 FROM listings l WHERE l.vehicle_id = v.id
-                        AND l.match_status IN ('manual_pending', 'rejected'))) AS provisional,
+                        AND l.match_status IN ('manual_pending', 'rejected', 'pending_rereview'))) AS provisional,
                   count(*) FILTER (WHERE NOT EXISTS (
                       SELECT 1 FROM listings l WHERE l.vehicle_id = v.id
-                        AND l.match_status IN ('manual_pending', 'rejected'))) AS confirmed
+                        AND l.match_status IN ('manual_pending', 'rejected', 'pending_rereview'))) AS confirmed
            FROM vehicles v""") or {}
     review = pool.query_one(
         "SELECT count(*) AS pending FROM manual_review_queue WHERE status = 'pending'") or {}
+    rereview = pool.query_one(
+        "SELECT count(*) AS n FROM listings WHERE match_status = 'pending_rereview'") or {}
+    from carscout import rules as rules_mod
+
+    active_rule = rules_mod.active_version_row()
     anomalies = pool.query(
         """SELECT platform, category, count(*) AS n FROM ingest_anomalies
            WHERE created_at > now() - interval '7 days' GROUP BY platform, category
@@ -286,5 +292,11 @@ def overview() -> dict[str, Any]:
         "confirmed_vehicles": vehicles.get("confirmed"),
         "provisional_vehicles": vehicles.get("provisional"),
         "pending_reviews": review.get("pending"),
+        "pending_rereview": rereview.get("n", 0),
+        "active_rule_version": (
+            {"id": active_rule["id"], "version": active_rule["version"],
+             "name": active_rule["name"], "status": active_rule["status"],
+             "rollouts": rules_mod.get_rollout(int(active_rule["id"]))}
+            if active_rule else None),
         "recent_anomalies": anomalies, "recent_runs": runs, "cursors": cursors,
     }

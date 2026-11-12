@@ -64,6 +64,10 @@ class Settings:
     recall_mileage_km: int = _int("RECALL_MILEAGE_KM", 9000)
     candidate_limit: int = _int("CANDIDATE_LIMIT", 40)
 
+    # rule-version replay: exceeding either bound forces manual approval before activation
+    replay_max_extra_merges: int = _int("REPLAY_MAX_EXTRA_MERGES", 10)
+    replay_max_split_confirmed: int = _int("REPLAY_MAX_SPLIT_CONFIRMED", 0)
+
     fingerprint_skip_unchanged: bool = _bool("FINGERPRINT_SKIP_UNCHANGED", True)
     max_pages_per_run: int = _int("MAX_PAGES_PER_RUN", 200)
 
